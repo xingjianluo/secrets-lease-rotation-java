@@ -10,6 +10,10 @@ public enum DenyReason {
     UNKNOWN_KEY_VERSION,
     /** 密钥版本已轮换且宽限期结束，旧密文被明确拒绝（不静默降级）。 */
     KEY_VERSION_GRACE_EXPIRED,
+    /** 密钥版本已被清理移出托管库：再读/再升级必须明确拒绝，不得用当前版本顶替。 */
+    KEY_VERSION_PURGED,
+    /** 清理前置条件不满足（版本是当前版本 / 尚在宽限期 / 不存在）。 */
+    KEY_VERSION_NOT_PURGEABLE,
     /** 主体不存在（未登记）。 */
     UNKNOWN_SUBJECT,
     /** 租约不存在。 */

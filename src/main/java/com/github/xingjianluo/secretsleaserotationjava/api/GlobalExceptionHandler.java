@@ -48,8 +48,10 @@ public class GlobalExceptionHandler {
     private HttpStatus statusFor(DenyReason reason) {
         return switch (reason) {
             case ROTATION_IN_PROGRESS -> HttpStatus.CONFLICT;                 // 409
-            case UNKNOWN_KEY_VERSION, KEY_VERSION_GRACE_EXPIRED ->
+            case UNKNOWN_KEY_VERSION, KEY_VERSION_GRACE_EXPIRED, KEY_VERSION_PURGED ->
                     HttpStatus.GONE;                                          // 410 版本不可用
+            case KEY_VERSION_NOT_PURGEABLE ->
+                    HttpStatus.PRECONDITION_FAILED;                            // 412 清理前置条件不满足
             case UNKNOWN_SUBJECT, UNKNOWN_LEASE -> HttpStatus.NOT_FOUND;      // 404
             case LEASE_EXPIRED, LEASE_REVOKED -> HttpStatus.FORBIDDEN;        // 403
             case SCOPE_MISMATCH -> HttpStatus.FORBIDDEN;                      // 403 越权

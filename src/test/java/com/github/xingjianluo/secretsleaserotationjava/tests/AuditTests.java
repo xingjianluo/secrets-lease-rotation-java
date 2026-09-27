@@ -117,4 +117,80 @@ class AuditTests {
     private static String abbrev(String s) {
         return s == null ? null : s.substring(0, Math.min(8, s.length())) + "..";
     }
+
+    @Test
+    void upgradeIsAuditedAndAuditFailureReleasesNoNewCiphertext() {
+        TestInfra infra = TestInfra.newInfra();
+        infra.service.registerSubject("alice");
+        EncryptResult enc = infra.service.encrypt("payroll", "upgrade-me");
+        LeaseIssueResult lease = infra.service.issueLease("alice", "payroll", Duration.ofHours(100));
+        infra.service.rotate(Duration.ofHours(24));
+
+        // 审计写不进去：即便校验全过、新密文已在内存算出，也必须 fail-closed，绝不吐出新密文
+        infra.auditSink.failNext();
+        long before = infra.auditEvents().size();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> {
+                    log.info("升级 fail-closed 输入: leaseId={}（审计将注入失败）", lease.leaseId());
+                    infra.service.upgrade(lease.leaseId(), enc.ciphertext());
+                })
+                .isInstanceOf(AuditFailureException.class)
+                .satisfies(e -> log.info("升级 fail-closed 判定={} msg={}",
+                        ((AuditFailureException) e).reason(), e.getMessage()));
+        assertThat(infra.auditEvents()).hasSize((int) before);
+        boolean leaked = infra.auditEvents().stream()
+                .anyMatch(e -> e.action() == Action.UPGRADE_SECRET && "SUCCESS".equals(e.result()));
+        assertThat(leaked).as("审计失败时不得有成功升级记录，更不得返回新密文").isFalse();
+
+        // 审计恢复后升级成功，留痕关联主体/作用域/目标版本/租约
+        var up = infra.service.upgrade(lease.leaseId(), enc.ciphertext());
+        AuditEvent success = infra.auditEvents().stream()
+                .filter(e -> e.action() == Action.UPGRADE_SECRET && "SUCCESS".equals(e.result()))
+                .findFirst().orElseThrow();
+        log.info("升级成功审计: subject={} scope={} v{} lease={} detail={}",
+                success.subject(), success.scope(), success.keyVersion(),
+                abbrev(success.leaseId()), success.detail());
+        assertThat(success.subject()).isEqualTo("alice");
+        assertThat(success.scope()).isEqualTo("payroll");
+        assertThat(success.keyVersion()).isEqualTo(up.targetVersion()).isEqualTo(2);
+        assertThat(success.leaseId()).isEqualTo(lease.leaseId());
+    }
+
+    @Test
+    void deniedUpgradeAndPurgeAreRecordedWithDecisionBasis() {
+        TestInfra infra = TestInfra.newInfra();
+        infra.service.registerSubject("alice");
+        LeaseIssueResult lease = infra.service.issueLease("alice", "payroll", Duration.ofHours(100));
+        EncryptResult enc = infra.service.encrypt("payroll", "s");
+
+        // 宽限期为 0 轮换并推进时间后，旧 v1 密文升级应被 GRACE_EXPIRED 拒绝并留痕
+        infra.service.rotate(Duration.ZERO);
+        infra.advance(Duration.ofMillis(1));
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                        () -> infra.service.upgrade(lease.leaseId(), enc.ciphertext()))
+                .isInstanceOf(com.github.xingjianluo.secretsleaserotationjava.exception.KeyGraceExpiredException.class);
+        AuditEvent deniedUpgrade = infra.auditEvents().stream()
+                .filter(e -> e.action() == Action.UPGRADE_SECRET && e.result().startsWith("DENIED"))
+                .findFirst().orElseThrow();
+        assertThat(deniedUpgrade.result()).isEqualTo("DENIED:KEY_VERSION_GRACE_EXPIRED");
+        assertThat(deniedUpgrade.leaseId()).isEqualTo(lease.leaseId());
+        log.info("升级拒绝审计: result={} detail={}", deniedUpgrade.result(), deniedUpgrade.detail());
+
+        // 清理当前版本 v2 必须被拒绝并留痕
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> infra.service.purgeKeyVersion(2))
+                .isInstanceOf(com.github.xingjianluo.secretsleaserotationjava.exception.KeyVersionNotPurgeableException.class);
+        AuditEvent deniedPurge = infra.auditEvents().stream()
+                .filter(e -> e.action() == Action.PURGE_KEY_VERSION && e.result().startsWith("DENIED"))
+                .findFirst().orElseThrow();
+        assertThat(deniedPurge.result()).isEqualTo("DENIED:KEY_VERSION_NOT_PURGEABLE");
+        assertThat(deniedPurge.keyVersion()).isEqualTo(2);
+        log.info("清理拒绝审计: result={} detail={}", deniedPurge.result(), deniedPurge.detail());
+
+        // 清理成功留痕
+        infra.service.purgeKeyVersion(1);
+        AuditEvent purged = infra.auditEvents().stream()
+                .filter(e -> e.action() == Action.PURGE_KEY_VERSION && "SUCCESS".equals(e.result()))
+                .findFirst().orElseThrow();
+        assertThat(purged.keyVersion()).isEqualTo(1);
+        assertThat(purged.detail()).contains("移出密钥材料");
+    }
 }
