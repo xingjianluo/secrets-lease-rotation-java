@@ -17,19 +17,23 @@ public final class KeyVersion {
     private final boolean current;
     private final Instant retiredAt;
     private final Instant graceDeadline;
+    private final boolean purged;
+    private final Instant purgedAt;
 
     public KeyVersion(int version, byte[] secret, Instant createdAt, boolean current) {
-        this(version, secret, createdAt, current, null, null);
+        this(version, secret, createdAt, current, null, null, false, null);
     }
 
     private KeyVersion(int version, byte[] secret, Instant createdAt, boolean current,
-                       Instant retiredAt, Instant graceDeadline) {
+                       Instant retiredAt, Instant graceDeadline, boolean purged, Instant purgedAt) {
         this.version = version;
         this.secret = secret;
         this.createdAt = createdAt;
         this.current = current;
         this.retiredAt = retiredAt;
         this.graceDeadline = graceDeadline;
+        this.purged = purged;
+        this.purgedAt = purgedAt;
     }
 
     public int version() { return version; }
@@ -38,10 +42,17 @@ public final class KeyVersion {
     public boolean isCurrent() { return current; }
     public Instant retiredAt() { return retiredAt; }
     public Instant graceDeadline() { return graceDeadline; }
+    public boolean isPurged() { return purged; }
+    public Instant purgedAt() { return purgedAt; }
 
     /** 生成一个内容相同但已退役、带宽限期截止时刻的副本。 */
     public KeyVersion retiredCopy(Instant now, Instant deadline) {
-        return new KeyVersion(version, secret, createdAt, false, now, deadline);
+        return new KeyVersion(version, secret, createdAt, false, now, deadline, false, null);
+    }
+
+    /** 生成一个“已清理”墓碑副本：密钥材料不再可用，仅保留可解释的元数据。 */
+    public KeyVersion purgedCopy(Instant now) {
+        return new KeyVersion(version, null, createdAt, false, retiredAt, graceDeadline, true, now);
     }
 
     /**

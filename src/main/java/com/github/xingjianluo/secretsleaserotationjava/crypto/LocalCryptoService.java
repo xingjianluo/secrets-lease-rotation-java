@@ -1,5 +1,6 @@
 package com.github.xingjianluo.secretsleaserotationjava.crypto;
 
+import com.github.xingjianluo.secretsleaserotationjava.exception.CiphertextInvalidException;
 import com.github.xingjianluo.secretsleaserotationjava.exception.UnknownKeyVersionException;
 import org.springframework.stereotype.Service;
 
@@ -53,7 +54,11 @@ public class LocalCryptoService {
         }
     }
 
-    /** 解密（GCM 同时校验完整性，密钥错误或被篡改会抛异常）。 */
+    /**
+     * 解密（GCM 同时校验完整性，密钥错误或密文被篡改会抛异常）。
+     * 能走到这里说明信封格式与版本号可解析，因此失败明确归类为密文失效/被篡改
+     * （{@link CiphertextInvalidException}），与“版本不存在”区分开。
+     */
     public String decrypt(byte[] key, byte[] ivAndCiphertext) {
         try {
             byte[] iv = new byte[IV_LENGTH];
@@ -65,7 +70,7 @@ public class LocalCryptoService {
                     new GCMParameterSpec(TAG_BITS, iv));
             return new String(cipher.doFinal(ct), StandardCharsets.UTF_8);
         } catch (Exception e) {
-            throw new UnknownKeyVersionException("密文完整性校验或解密失败", e);
+            throw new CiphertextInvalidException("密文完整性校验失败（密钥不符或已被篡改）", e);
         }
     }
 

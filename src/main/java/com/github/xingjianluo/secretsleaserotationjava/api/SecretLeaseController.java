@@ -68,4 +68,25 @@ public class SecretLeaseController {
     public RevokeResult revoke(@RequestBody RevokeRequest req) {
         return service.revoke(req.leaseId());
     }
+
+    /** 单份旧密文升级到当前版本。 */
+    @PostMapping("/secrets/upgrade")
+    public com.github.xingjianluo.secretsleaserotationjava.model.UpgradeResult upgrade(
+            @RequestBody com.github.xingjianluo.secretsleaserotationjava.api.dto.Requests.UpgradeRequest req) {
+        return service.upgrade(req.leaseId(), req.ciphertext());
+    }
+
+    /** 一批旧密文并行升级，全有或全无。 */
+    @PostMapping("/secrets/upgrade-batch")
+    public com.github.xingjianluo.secretsleaserotationjava.model.UpgradeResult upgradeBatch(
+            @RequestBody com.github.xingjianluo.secretsleaserotationjava.api.dto.Requests.UpgradeBatchRequest req) {
+        return service.upgradeBatch(req.leaseId(), req.ciphertexts());
+    }
+
+    /** 清理一个宽限期已结束的退役密钥版本。 */
+    @PostMapping("/keys/purge")
+    public com.github.xingjianluo.secretsleaserotationjava.model.PurgeResult purge(
+            @RequestBody com.github.xingjianluo.secretsleaserotationjava.api.dto.Requests.PurgeRequest req) {
+        return service.purgeKeyVersion(req.version());
+    }
 }

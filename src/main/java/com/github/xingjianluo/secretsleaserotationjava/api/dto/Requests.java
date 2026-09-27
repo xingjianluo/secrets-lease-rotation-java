@@ -25,4 +25,16 @@ public final class Requests {
 
     public record RevokeRequest(String leaseId) {
     }
+
+    /** 单份密文升级请求。 */
+    public record UpgradeRequest(String leaseId, String ciphertext) {
+    }
+
+    /** 一批密文升级请求（整批全有或全无）。 */
+    public record UpgradeBatchRequest(String leaseId, java.util.List<String> ciphertexts) {
+    }
+
+    /** 退役版本清理请求。 */
+    public record PurgeRequest(Integer version) {
+    }
 }

@@ -75,6 +75,50 @@ class SecretLeaseApiTests {
                 404, "UNKNOWN_SUBJECT");
     }
 
+    @Test
+    void httpUpgradeBatchAndPurgeReturnConsistentReasonAndStatus() throws Exception {
+        postOk("/api/subjects", """
+                {"subject":"alice"}""");
+        MvcResult enc = postOk("/api/encrypt", """
+                {"scope":"payroll","plaintext":"salary-up"}""");
+        String v1Cipher = om.readTree(enc.getResponse().getContentAsString()).get("ciphertext").asText();
+        MvcResult lease = postOk("/api/leases", """
+                {"subject":"alice","scope":"payroll","ttl":"PT10M"}""");
+        String leaseId = om.readTree(lease.getResponse().getContentAsString()).get("leaseId").asText();
+        postOk("/api/keys/rotate", """
+                {"gracePeriod":"PT0S"}""");
+
+        // 宽限期为 0：升级旧密文必须 410 + KEY_VERSION_GRACE_EXPIRED，整批无新密文
+        String batchBody = "{\"leaseId\":\"" + leaseId + "\",\"ciphertexts\":[\""
+                + v1Cipher + "\"]}";
+        assertDeny("/api/secrets/upgrade-batch", batchBody, 410, "KEY_VERSION_GRACE_EXPIRED");
+
+        // 宽限已过：清理 v1 成功 200
+        MvcResult purged = postOk("/api/keys/purge", """
+                {"version":1}""");
+        JsonNode purgeJson = om.readTree(purged.getResponse().getContentAsString());
+        log.info("HTTP 清理成功 version={} at={}", purgeJson.get("version").asInt(),
+                purgeJson.get("purgedAt").asText());
+
+        // 清理后读取：410 + KEY_VERSION_PURGED（不能拿当前版本顶替）
+        assertDeny("/api/read",
+                "{\"leaseId\":\"" + leaseId + "\",\"ciphertext\":\"" + v1Cipher + "\"}",
+                410, "KEY_VERSION_PURGED");
+
+        // 清理当前版本：409 + KEY_VERSION_NOT_PURGEABLE
+        assertDeny("/api/keys/purge", """
+                {"version":2}""", 409, "KEY_VERSION_NOT_PURGEABLE");
+
+        // 重复清理已移除版本：410 + KEY_VERSION_PURGED
+        assertDeny("/api/keys/purge", """
+                {"version":1}""", 410, "KEY_VERSION_PURGED");
+
+        // 租约关：未知租约升级 404
+        assertDeny("/api/secrets/upgrade",
+                "{\"leaseId\":\"missing\",\"ciphertext\":\"" + v1Cipher + "\"}",
+                404, "UNKNOWN_LEASE");
+    }
+
     private void assertDeny(String url, String body, int httpStatus, String reason) throws Exception {
         MvcResult r = mvc.perform(post(url).contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().is(httpStatus))

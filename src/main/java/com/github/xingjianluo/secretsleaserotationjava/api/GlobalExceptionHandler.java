@@ -50,6 +50,9 @@ public class GlobalExceptionHandler {
             case ROTATION_IN_PROGRESS -> HttpStatus.CONFLICT;                 // 409
             case UNKNOWN_KEY_VERSION, KEY_VERSION_GRACE_EXPIRED ->
                     HttpStatus.GONE;                                          // 410 版本不可用
+            case KEY_VERSION_PURGED -> HttpStatus.GONE;                       // 410 版本已被移除
+            case KEY_VERSION_NOT_PURGEABLE -> HttpStatus.CONFLICT;            // 409 前置条件不满足
+            case CIPHERTEXT_INVALID -> HttpStatus.UNPROCESSABLE_ENTITY;       // 422 密文被篡改
             case UNKNOWN_SUBJECT, UNKNOWN_LEASE -> HttpStatus.NOT_FOUND;      // 404
             case LEASE_EXPIRED, LEASE_REVOKED -> HttpStatus.FORBIDDEN;        // 403
             case SCOPE_MISMATCH -> HttpStatus.FORBIDDEN;                      // 403 越权
