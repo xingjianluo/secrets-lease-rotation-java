@@ -246,8 +246,11 @@ public class SecretLeaseService {
      * <ul>
      *   <li>升级前后明文、作用域完全一致；新密文用同一租约读取落在锁定的当前版本上；</li>
      *   <li>密文不可解（含被篡改）或租约任一项不过关，整批被明确拒绝，<b>绝不吐出任何新密文</b>；</li>
-     *   <li>条目之间并行处理，量大时不退化串行；</li>
-     *   <li>每次升级要么落到一个当时真实存在的当前版本，要么被拒绝，不产生引用不存在版本的密文；</li>
+     *   <li>条目之间并行处理，量大时不退化串行（解密/重加密都在提交闸门之外完成）；</li>
+     *   <li>提交（复核目标版本 + 审计 + 返回）在密钥库读锁关键区内完成，与轮换/清理互斥：
+     *       目标版本在提交前若已被清理，整批以 {@code KEY_VERSION_PURGED} 明确拒绝，
+     *       不拿别的当前版本顶替；宽限恰好在提交时结束则以 {@code KEY_VERSION_GRACE_EXPIRED}
+     *       拒绝。成功返回的密文引用的必是返回那一刻真实存在且可读的版本；</li>
      *   <li>成功与拒绝都留痕；审计写不进去时 fail-closed，不放行任何新密文。</li>
      * </ul>
      */
@@ -258,8 +261,9 @@ public class SecretLeaseService {
         final int batchSize = ciphertexts.size();
         log.info("升级请求: leaseId={}, batchSize={}", leaseId, batchSize);
 
-        // 租约只校验一次，对整批生效；目标版本在请求开始时锁定一次，整批一致，
-        // 因此即便中途发生轮换，每条新密文引用的都是一个真实存在过的当前版本。
+        // 租约只校验一次，对整批生效；目标版本在请求开始时锁定一次，整批一致。
+        // 目标版本在提交那一刻是否仍存活，由密钥库提交闸门（与轮换/清理互斥）复核，
+        // 防止"重加密期间目标版本被轮换并清理"导致新密文引用已不存在的版本。
         Lease lease = leaseStore.find(leaseId).orElse(null);
         if (lease == null) {
             throw denyUpgrade(leaseId, null, 0, batchSize,
@@ -358,20 +362,34 @@ public class SecretLeaseService {
             }
         }
 
-        List<UpgradeResult> results = new ArrayList<>(batchSize);
+        // 全部条目都已在内存中产出且无一失败。提交（目标版本复核 + 审计 + 返回新密文）
+        // 在密钥库的读锁关键区内完成，与轮换/清理的写锁互斥——这是升级的线性化点：
+        //   · 提交前目标版本若已被清理/宽限结束：这里必能看到墓碑/最新状态，整批拒绝，
+        //     绝不吐出引用已不存在版本的密文，也不拿别的当前版本顶替；
+        //   · 复核通过才写审计并返回，返回的每条密文引用的都是返回那一刻真实存在且可读的版本。
+        // 耗时的解密/重加密全部发生在闸门之外，条目并行度不受影响。
+        final String versions = describeSourceVersions(envelopes);
+        final List<UpgradeResult> results = new ArrayList<>(batchSize);
         for (ItemOutcome o : outcomes) {
             results.add(o.result());
         }
-
-        // 全部条目都已在内存中产出且无一失败，审计先于新密文返回；
-        // 审计落不下来则整体 fail-closed，调用方拿不到任何新密文。
-        String versions = describeSourceVersions(envelopes);
-        audit(Action.UPGRADE_SECRET, lease.subject(), lease.scope(), targetVersion, leaseId,
-                "SUCCESS", "批次=" + batchSize + "，源版本[" + versions + "] -> v"
-                        + targetVersion + "，目标版本在请求开始时锁定");
-        log.info("升级成功: leaseId={}, subject={}, scope={}, batchSize={}, 源版本{} -> v{}",
-                leaseId, lease.subject(), lease.scope(), batchSize, versions, targetVersion);
-        return results;
+        return keyStore.commitUpgrade(targetVersion, () -> {
+            try {
+                Instant commitAt = Instant.now(clock);
+                keyStore.requireReadableAtCommit(targetVersion, commitAt);
+            } catch (SecretLeaseException e) {
+                log.warn("升级提交拒绝: leaseId={}, scope={}, batchSize={}, targetVersion=v{}, 判定={}, 依据={}",
+                        leaseId, lease.scope(), batchSize, targetVersion, e.reason(), e.getMessage());
+                throw denyUpgradeCommit(leaseId, lease.scope(), batchSize, targetVersion, e);
+            }
+            // 复核通过后，审计仍在闸门内、先于新密文返回；审计落不下来整体 fail-closed。
+            audit(Action.UPGRADE_SECRET, lease.subject(), lease.scope(), targetVersion, leaseId,
+                    "SUCCESS", "批次=" + batchSize + "，源版本[" + versions + "] -> v"
+                            + targetVersion + "，目标版本在提交闸门内复核仍存活");
+            log.info("升级成功: leaseId={}, subject={}, scope={}, batchSize={}, 源版本{} -> v{}",
+                    leaseId, lease.subject(), lease.scope(), batchSize, versions, targetVersion);
+            return results;
+        });
     }
 
     /** 单条升级的纯计算：定位源版本（存活/已清理/未知）→ 宽限判定 → 解密 → 目标版本重加密。 */
@@ -495,6 +513,19 @@ public class SecretLeaseService {
                                              String cipherScope, Integer sourceVersion,
                                              SecretLeaseException e) {
         return denyUpgrade(leaseId, leaseScope, cipherScope, sourceVersion, 0, 1, e);
+    }
+
+    /**
+     * 提交闸门复核失败（目标版本在重加密期间被清理 / 宽限恰好结束）：整批拒绝。
+     * 审计明确标注阶段为"提交闸门复核"，区别于条目自身校验失败，不吐出任何新密文。
+     */
+    private SecretLeaseException denyUpgradeCommit(String leaseId, String scope, int batchSize,
+                                                   int targetVersion, SecretLeaseException e) {
+        audit(Action.UPGRADE_SECRET, null, scope, targetVersion, leaseId,
+                "DENIED:" + e.reason().name(),
+                "批次=" + batchSize + "，阶段=提交闸门复核，目标版本 v" + targetVersion
+                        + " 在返回前已不可作为落脚版本，整批拒绝，依据=" + e.getMessage());
+        return e;
     }
 
     /** 汇总一批信封的源版本，如 "v1,v1,v2"。 */
