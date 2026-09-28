@@ -14,6 +14,8 @@ public enum DenyReason {
     KEY_VERSION_PURGED,
     /** 清理前置条件不满足（版本是当前版本 / 尚在宽限期 / 不存在）。 */
     KEY_VERSION_NOT_PURGEABLE,
+    /** 升级在处理期间其锁定的目标版本已被轮换取代（当前版本变成了更新的版本），整批拒绝，请基于当前版本重试。 */
+    UPGRADE_TARGET_SUPERSEDED,
     /** 主体不存在（未登记）。 */
     UNKNOWN_SUBJECT,
     /** 租约不存在。 */

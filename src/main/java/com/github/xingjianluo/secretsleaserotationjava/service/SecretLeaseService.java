@@ -14,6 +14,7 @@ import com.github.xingjianluo.secretsleaserotationjava.exception.UnknownKeyVersi
 import com.github.xingjianluo.secretsleaserotationjava.exception.UnknownLeaseException;
 import com.github.xingjianluo.secretsleaserotationjava.exception.UnknownSubjectException;
 import com.github.xingjianluo.secretsleaserotationjava.exception.ScopeMismatchException;
+import com.github.xingjianluo.secretsleaserotationjava.exception.UpgradeTargetSupersededException;
 import com.github.xingjianluo.secretsleaserotationjava.model.Action;
 import com.github.xingjianluo.secretsleaserotationjava.model.AuditEvent;
 import com.github.xingjianluo.secretsleaserotationjava.model.EncryptResult;
@@ -244,11 +245,15 @@ public class SecretLeaseService {
      *
      * <p>保证：
      * <ul>
-     *   <li>升级前后明文、作用域完全一致；新密文用同一租约读取落在锁定的当前版本上；</li>
+     *   <li>升级前后明文、作用域完全一致；新密文用同一租约读取落在提交时仍真实存在的当前版本上；</li>
      *   <li>密文不可解（含被篡改）或租约任一项不过关，整批被明确拒绝，<b>绝不吐出任何新密文</b>；</li>
      *   <li>条目之间并行处理，量大时不退化串行；</li>
-     *   <li>每次升级要么落到一个当时真实存在的当前版本，要么被拒绝，不产生引用不存在版本的密文；</li>
-     *   <li>成功与拒绝都留痕；审计写不进去时 fail-closed，不放行任何新密文。</li>
+     *   <li>提交点（{@link ManagedKeyStore#commitUpgrade}）在与轮换/清理互斥的变更锁内，
+     *       对最新快照复核锁定的目标版本：目标版本在处理期间被轮换取代 →
+     *       {@code UPGRADE_TARGET_SUPERSEDED} 整批拒绝；已被清理 → {@code KEY_VERSION_PURGED}
+     *       整批拒绝（看得出"该版本已被移除"，不用当前版本顶替，不会先返回新密文再暴露问题）；
+     *       只有目标版本在提交瞬间仍是当前版本才放行——成功升级返回的密文引用的必是当前版本；</li>
+     *   <li>成功与拒绝都留痕；成功审计在提交关键区内写入，审计写不进去时 fail-closed，不放行任何新密文。</li>
      * </ul>
      */
     public List<UpgradeResult> upgradeBatch(String leaseId, List<String> ciphertexts) {
@@ -258,8 +263,9 @@ public class SecretLeaseService {
         final int batchSize = ciphertexts.size();
         log.info("升级请求: leaseId={}, batchSize={}", leaseId, batchSize);
 
-        // 租约只校验一次，对整批生效；目标版本在请求开始时锁定一次，整批一致，
-        // 因此即便中途发生轮换，每条新密文引用的都是一个真实存在过的当前版本。
+        // 租约只校验一次，对整批生效；目标版本在请求开始时锁定一次，整批一致。
+        // 该目标版本是否在提交时仍为当前版本，由最后的 commitUpgrade 提交点在变更锁内复核，
+        // 因此处理期间发生的轮换/清理不可能让本批结果引用一个已退役/已清理的版本。
         Lease lease = leaseStore.find(leaseId).orElse(null);
         if (lease == null) {
             throw denyUpgrade(leaseId, null, 0, batchSize,
@@ -362,16 +368,44 @@ public class SecretLeaseService {
         for (ItemOutcome o : outcomes) {
             results.add(o.result());
         }
+        final String versions = describeSourceVersions(envelopes);
 
-        // 全部条目都已在内存中产出且无一失败，审计先于新密文返回；
-        // 审计落不下来则整体 fail-closed，调用方拿不到任何新密文。
-        String versions = describeSourceVersions(envelopes);
-        audit(Action.UPGRADE_SECRET, lease.subject(), lease.scope(), targetVersion, leaseId,
-                "SUCCESS", "批次=" + batchSize + "，源版本[" + versions + "] -> v"
-                        + targetVersion + "，目标版本在请求开始时锁定");
-        log.info("升级成功: leaseId={}, subject={}, scope={}, batchSize={}, 源版本{} -> v{}",
+        // 提交点：全部条目都已在内存中产出且无一失败。进入与轮换/清理互斥的变更锁，
+        // 对最新快照复核锁定的目标版本，并在锁内写成功审计。
+        //   - 目标版本已被清理 -> KEY_VERSION_PURGED（看得出"该版本已被移除"）；
+        //   - 目标版本已被轮换取代 -> UPGRADE_TARGET_SUPERSEDED；
+        //   - 变更仍在进行/等待超时 -> ROTATION_IN_PROGRESS；
+        //   - 审计写不进去 -> AUDIT_FAILURE（fail-closed）。
+        // 任一情况都整批拒绝，results 仅存在于本方法栈、不外泄。
+        try {
+            keyStore.commitUpgrade(targetVersion, () -> audit(
+                    Action.UPGRADE_SECRET, lease.subject(), lease.scope(), targetVersion, leaseId,
+                    "SUCCESS", "批次=" + batchSize + "，源版本[" + versions + "] -> v"
+                            + targetVersion + "，目标版本在请求开始时锁定、提交时复核仍为当前版本"));
+        } catch (KeyVersionPurgedException | UpgradeTargetSupersededException
+                 | RotationConflictException e) {
+            throw denyUpgradeCommit(lease, targetVersion, versions, batchSize, e);
+        }
+        log.info("升级成功: leaseId={}, subject={}, scope={}, batchSize={}, 源版本{} -> v{}（提交点复核通过）",
                 leaseId, lease.subject(), lease.scope(), batchSize, versions, targetVersion);
         return results;
+    }
+
+    /**
+     * 提交点拒绝：条目都已重加密完毕，但目标版本在处理期间被轮换/清理，或变更仍在进行。
+     * 整批拒绝，不吐出任何新密文；审计的 keyVersion 记被锁定的目标版本，detail 说明这是提交点判定。
+     */
+    private SecretLeaseException denyUpgradeCommit(Lease lease, int targetVersion,
+                                                   String sourceVersions, int batchSize,
+                                                   SecretLeaseException e) {
+        audit(Action.UPGRADE_SECRET, lease.subject(), lease.scope(), targetVersion, lease.leaseId(),
+                "DENIED:" + e.reason().name(),
+                "批次=" + batchSize + "，源版本[" + sourceVersions + "]，提交点复核目标版本 v"
+                        + targetVersion + "：" + e.getMessage());
+        log.warn("升级整批拒绝(提交点): leaseId={}, subject={}, scope={}, batchSize={}, 锁定目标=v{}, 判定={}, 依据={}",
+                lease.leaseId(), lease.subject(), lease.scope(), batchSize,
+                targetVersion, e.reason(), e.getMessage());
+        return e;
     }
 
     /** 单条升级的纯计算：定位源版本（存活/已清理/未知）→ 宽限判定 → 解密 → 目标版本重加密。 */

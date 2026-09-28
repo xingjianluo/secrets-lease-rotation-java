@@ -2,8 +2,10 @@ package com.github.xingjianluo.secretsleaserotationjava.service;
 
 import com.github.xingjianluo.secretsleaserotationjava.crypto.LocalCryptoService;
 import com.github.xingjianluo.secretsleaserotationjava.exception.KeyVersionNotPurgeableException;
+import com.github.xingjianluo.secretsleaserotationjava.exception.KeyVersionPurgedException;
 import com.github.xingjianluo.secretsleaserotationjava.exception.RotationConflictException;
 import com.github.xingjianluo.secretsleaserotationjava.exception.UnknownKeyVersionException;
+import com.github.xingjianluo.secretsleaserotationjava.exception.UpgradeTargetSupersededException;
 import com.github.xingjianluo.secretsleaserotationjava.model.KeyVersion;
 import org.springframework.stereotype.Component;
 
@@ -39,6 +41,13 @@ public class ManagedKeyStore {
 
     /** 变更关键区持有的最长时间；超时未拿到锁也按冲突处理，而不是无限等待。 */
     private static final long LOCK_WAIT_MILLIS = 0L;
+
+    /**
+     * 升级提交点等待变更锁的最长时间。升级的重加密在锁外并行完成，只在最后提交时短暂进锁，
+     * 给一个很小的有界等待，纯粹是为了避免"变更恰好刚释放锁"造成的伪冲突；拿不到锁仍按
+     * 冲突明确拒绝（调用方可基于当前版本重试），不会无限等待，也不会串行化加解密本身。
+     */
+    private static final long UPGRADE_COMMIT_LOCK_WAIT_MILLIS = 250L;
 
     private record Snapshot(Map<Integer, KeyVersion> versions,
                             Map<Integer, PurgedVersion> purged, int currentVersion) {
@@ -161,6 +170,63 @@ public class ManagedKeyStore {
             snapshot.set(new Snapshot(Map.copyOf(nextVersions),
                     Map.copyOf(nextPurged), before.currentVersion()));
             return outcome;
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    /**
+     * 升级提交点：一批密文已在锁外并行完成"解密 → 重加密"，返回新密文前在此对
+     * <b>最新快照</b>做最终校验，并在同一把变更锁内完成成功审计。与 {@link #rotate}、
+     * {@link #purge} 互斥，从而给升级确定一个线性化点，保证：
+     * <ul>
+     *   <li>提交时目标版本已被清理 → 抛 {@link KeyVersionPurgedException}（看得出"该版本已被移除"）；</li>
+     *   <li>提交时目标版本已被轮换取代（仍是存活的退役版本，但不再是当前版本）
+     *       → 抛 {@link UpgradeTargetSupersededException}，整批拒绝、不悄悄改用新版本顶替；</li>
+     *   <li>只有目标版本在提交瞬间仍是真实存在的当前版本时才放行，新密文引用的就是当前版本。</li>
+     * </ul>
+     *
+     * <p>{@code onSuccess} 在持锁状态、且校验通过后被调用（写入成功审计）：审计失败则直接抛出，
+     * 本次升级被拒绝，与"成功才留痕、失败不放行任何新密文"的 fail-closed 语义一致。
+     * 本方法不改动任何密钥状态，只是让"判定 + 审计"对轮换/清理原子化。
+     *
+     * @param targetVersion 请求开始时锁定的目标版本号
+     * @param onSuccess     校验通过后的成功审计回调
+     */
+    public void commitUpgrade(int targetVersion, Runnable onSuccess) {
+        boolean acquired;
+        try {
+            acquired = mutationLock.tryLock(UPGRADE_COMMIT_LOCK_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RotationConflictException("升级提交等待被中断");
+        }
+        if (!acquired) {
+            throw new RotationConflictException(
+                    "升级提交时密钥变更（轮换/清理）正在进行，本次升级整批拒绝，请基于当前版本重试");
+        }
+        try {
+            Snapshot now = snapshot.get();
+            if (now.purged().containsKey(targetVersion)) {
+                PurgedVersion tomb = now.purged().get(targetVersion);
+                throw new KeyVersionPurgedException("升级锁定的目标版本 v" + targetVersion
+                        + " 在这批密文处理期间已被清理移出(purgedAt=" + tomb.purgedAt()
+                        + ")，整批拒绝，不返回任何引用该版本的新密文，也不用当前版本顶替");
+            }
+            KeyVersion target = now.versions().get(targetVersion);
+            if (target == null) {
+                // 既不在存活集合也无墓碑：理论上版本号只会增不会凭空消失，仍按未知版本明确拒绝
+                throw new UnknownKeyVersionException(
+                        "升级锁定的目标版本 v" + targetVersion + " 提交时已不在托管库中，整批拒绝");
+            }
+            if (!target.isCurrent() || now.currentVersion() != targetVersion) {
+                int newest = now.currentVersion();
+                throw new UpgradeTargetSupersededException("升级锁定的目标版本 v" + targetVersion
+                        + " 在这批密文处理期间已被轮换取代，当前版本为 v" + newest
+                        + "，整批拒绝、不悄悄改写目标版本，请基于 v" + newest + " 重新升级");
+            }
+            // 持锁完成成功审计：审计写不进去则失败上抛，新密文不返回（fail-closed）
+            onSuccess.run();
         } finally {
             mutationLock.unlock();
         }

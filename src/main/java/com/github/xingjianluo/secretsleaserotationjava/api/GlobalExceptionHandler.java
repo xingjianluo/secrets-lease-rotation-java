@@ -47,7 +47,8 @@ public class GlobalExceptionHandler {
     /** 可区分原因到 HTTP 语义的固定映射。 */
     private HttpStatus statusFor(DenyReason reason) {
         return switch (reason) {
-            case ROTATION_IN_PROGRESS -> HttpStatus.CONFLICT;                 // 409
+            case ROTATION_IN_PROGRESS, UPGRADE_TARGET_SUPERSEDED ->
+                    HttpStatus.CONFLICT;                                            // 409 并发变更冲突，可基于当前版本重试
             case UNKNOWN_KEY_VERSION, KEY_VERSION_GRACE_EXPIRED, KEY_VERSION_PURGED ->
                     HttpStatus.GONE;                                          // 410 版本不可用
             case KEY_VERSION_NOT_PURGEABLE ->
